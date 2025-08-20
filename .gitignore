@@ -1,0 +1,41 @@
+# macOS
+.DS_Store
+
+# build artifacts
+/dist
+/build
+/.stack-work
+/.cabal-sandbox
+
+# editor
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# ghc artifacts
+*.hi
+*.o
+
+EOFcat > .gitignore <<'EOF'
+# macOS
+.DS_Store
+
+# build artifacts
+/dist
+/build
+/.stack-work
+/.cabal-sandbox
+
+# editor
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# ghc artifacts
+*.hi
+*.o
+
+/EasyR1/checkpoints
+/EasyR1/wandb
