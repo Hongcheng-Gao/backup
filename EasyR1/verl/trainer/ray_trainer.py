@@ -197,6 +197,7 @@ class RayPPOTrainer:
         processor: Optional[ProcessorMixin],
         train_dataloader: StatefulDataLoader,
         val_dataloader: StatefulDataLoader,
+        ood_val_dataloader: StatefulDataLoader,
         role_worker_mapping: dict[Role, Type[Worker]],
         resource_pool_manager: ResourcePoolManager,
         ray_worker_group_cls: Type[RayWorkerGroup] = RayWorkerGroup,
@@ -207,6 +208,7 @@ class RayPPOTrainer:
         self.processor = processor
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
+        self.ood_val_dataloader = ood_val_dataloader
 
         self.val_dataloader_train = top_k_stateful_loader(train_dataloader, k=100)
 
@@ -243,6 +245,8 @@ class RayPPOTrainer:
         self.val_reward_fn = val_reward_fn
 
         self.val_reward_score = 0.0
+        self.val_reward_score_train = 0.0
+        self.val_reward_score_ood = 0.0
         self.best_val_reward_score = -1.0
         self.best_global_step = None
 
@@ -563,6 +567,66 @@ class RayPPOTrainer:
         return {"val(train set)/reward_score": self.val_reward_score_train, **val_reward_metrics, **val_length_metrics}
         
        
+
+
+    def _validate_ood(self) -> dict[str, Any]:
+        reward_tensor_lst = []
+        # Lists to collect samples for the table
+        sample_inputs, sample_outputs, sample_labels, sample_scores = [], [], [], []
+        reward_metrics_lst = defaultdict(list)
+        length_metrics_lst = defaultdict(list)
+        print("Start validation ood...")
+        self.actor_rollout_ref_wg.prepare_rollout_engine()
+        for batch_dict in self.ood_val_dataloader:
+            test_batch = DataProto.from_single_dict(batch_dict)
+            test_gen_batch = test_batch.pop(
+                batch_keys=["input_ids", "attention_mask", "position_ids"],
+                non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
+            )
+            repeat_times = self.config.worker.rollout.val_override_config.get("n", 1)
+            test_gen_batch.meta_info = self.config.worker.rollout.val_override_config
+            test_gen_batch.meta_info["min_pixels"] = self.config.data.min_pixels
+            test_gen_batch.meta_info["max_pixels"] = self.config.data.max_pixels
+            test_gen_batch.meta_info["video_fps"] = self.config.data.video_fps
+
+            test_gen_batch, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_ref_wg.world_size)
+            test_output_gen_batch = self.actor_rollout_ref_wg.generate_sequences(test_gen_batch)
+            test_output_gen_batch = unpad_dataproto(test_output_gen_batch, pad_size=pad_size * repeat_times)
+
+            # repeat to align with repeated responses in rollout
+            test_batch = test_batch.repeat(repeat_times=repeat_times, interleave=True)
+            test_batch = test_batch.union(test_output_gen_batch)
+
+            # evaluate using reward_function
+            reward_tensor, reward_metrics = ray.get(self.val_reward_fn.compute_reward.remote(test_batch))
+
+            # store generations
+            input_ids = test_batch.batch["prompts"]
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            output_ids = test_batch.batch["responses"]
+            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            scores = reward_tensor.sum(-1).cpu().tolist()
+            sample_inputs.extend(input_texts)
+            sample_outputs.extend(output_texts)
+            sample_labels.extend(test_batch.non_tensor_batch["ground_truth"].tolist())
+            sample_scores.extend(scores)
+
+            reward_tensor_lst.append(reward_tensor)
+            for key, value in reward_metrics.items():
+                reward_metrics_lst[key].extend(value)
+
+            for key, value in compute_length_metrics(test_batch).items():
+                length_metrics_lst[key].append(value)
+
+        self.actor_rollout_ref_wg.release_rollout_engine()
+        self._maybe_log_val_generations(sample_inputs, sample_outputs, sample_labels, sample_scores)
+        self.val_reward_score_ood = torch.cat(reward_tensor_lst, dim=0).sum(-1).mean().item()
+        val_reward_metrics = {f"val(ood)/{key}_reward": value for key, value in reduce_metrics(reward_metrics_lst).items()}
+        val_length_metrics = {f"val(ood)_{key}": value for key, value in reduce_metrics(length_metrics_lst).items()}
+        print("Finish validation.")
+        return {"val(ood)/reward_score": self.val_reward_score_ood, **val_reward_metrics, **val_length_metrics}
+        
+
     def _balance_batch(self, batch: DataProto, metrics: dict[str, Any], logging_prefix: str = "global_seqlen") -> None:
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch["attention_mask"]
@@ -695,8 +759,10 @@ class RayPPOTrainer:
         if self.val_reward_fn is not None and self.config.trainer.val_before_train:
             val_metrics = self._validate()
             val_metrics_train = self._validate_train()
+            val_metrics_ood = self._validate_ood()
             self.logger.log(data=val_metrics, step=self.global_step)
             self.logger.log(data=val_metrics_train, step=self.global_step)
+            self.logger.log(data=val_metrics_ood, step=self.global_step)
             if self.config.trainer.val_only:
                 return
 
@@ -791,9 +857,11 @@ class RayPPOTrainer:
                     with timer("validation", timing_raw):
                         val_metrics = self._validate()
                         val_metrics_train = self._validate_train()
+                        val_metrics_ood = self._validate_ood()
 
                     metrics.update(val_metrics)
                     metrics.update(val_metrics_train)
+                    metrics.update(val_metrics_ood)
 
                 if self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0:
                     with timer("save_checkpoint", timing_raw):
@@ -817,11 +885,14 @@ class RayPPOTrainer:
             ):
                 val_metrics = self._validate()
                 val_metrics_train = self._validate_train()
+                val_metrics_ood = self._validate_ood()
                 self.logger.log(data=val_metrics, step=self.global_step)
                 self.logger.log(data=val_metrics_train, step=self.global_step)
+                self.logger.log(data=val_metrics_ood, step=self.global_step)
 
             print(f"Final validation metrics:\n{convert_dict_to_str(unflatten_dict(val_metrics))}")
             print(f"Final validation metrics train:\n{convert_dict_to_str(unflatten_dict(val_metrics_train))}")
+            print(f"Final validation metrics ood:\n{convert_dict_to_str(unflatten_dict(val_metrics_ood))}")
 
         if self.config.trainer.save_freq <= 0 or self.global_step % self.config.trainer.save_freq != 0:
             self._save_checkpoint()

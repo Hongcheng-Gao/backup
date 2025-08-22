@@ -15,6 +15,13 @@ python3 -m verl.trainer.main \
     data.max_response_length=20480 \
     data.rollout_batch_size=512 \
     data.mini_rollout_batch_size=256 \
+    ood_data.train_files=/mnt/workspace/ghc/data/datasets/8bit/train.parquet \
+    ood_data.val_files=/mnt/workspace/ghc/data/datasets/8bit/test.parquet \
+    ood_data.format_prompt=./examples/format_prompt/dapo.jinja \
+    ood_data.max_prompt_length=2048 \
+    ood_data.max_response_length=20480 \
+    ood_data.rollout_batch_size=512 \
+    ood_data.mini_rollout_batch_size=256 \
     worker.actor.ulysses_size=4 \
     worker.actor.model.model_path=${MODEL_PATH} \
     worker.actor.fsdp.torch_dtype=bf16 \

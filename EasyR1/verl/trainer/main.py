@@ -77,6 +77,7 @@ class Runner:
         val_reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
 
         train_dataloader, val_dataloader = create_dataloader(config.data, tokenizer, processor)
+        ood_train_dataloader, ood_val_dataloader = create_dataloader(config.ood_data, tokenizer, processor)
 
         trainer = RayPPOTrainer(
             config=config,
@@ -84,6 +85,7 @@ class Runner:
             processor=processor,
             train_dataloader=train_dataloader,
             val_dataloader=val_dataloader,
+            ood_val_dataloader=ood_val_dataloader,
             role_worker_mapping=role_worker_mapping,
             resource_pool_manager=resource_pool_manager,
             ray_worker_group_cls=ray_worker_group_cls,
